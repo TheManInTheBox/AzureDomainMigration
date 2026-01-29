@@ -1,0 +1,327 @@
+<#
+.SYNOPSIS
+  Read-only IIS audit for domain migration and SSL certificate readiness.
+
+.DESCRIPTION
+  Enumerates IIS app pools, sites, bindings, certificates, virtual directories,
+  and common config files to surface items that likely need updates when
+  changing domain and rotating certificates. No changes are made.
+
+.PARAMETER OldDomain
+  NetBIOS or FQDN of the old domain to detect old references (e.g., OLDDOM or olddom.local).
+
+.PARAMETER NewDomain
+  NetBIOS or FQDN of the new domain (used only for context in the report).
+
+.PARAMETER DeepConfigScan
+  If set, scans common config files under site physical paths for old domain strings.
+
+.PARAMETER OutputPath
+  Output path for JSON report. Defaults to the current directory.
+
+.NOTES
+  Requires: PowerShell 5+, IIS with WebAdministration module, read access to LocalMachine\My.
+  Run elevated to fully read certificate private key status.
+#>
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$true)]
+  [string]$OldDomain,
+
+  [Parameter(Mandatory=$false)]
+  [string]$NewDomain = "",
+
+  [switch]$DeepConfigScan,
+
+  [string]$OutputPath = "."
+)
+
+function Test-Module {
+  param([string]$Name)
+  if (-not (Get-Module -ListAvailable -Name $Name)) {
+    Write-Error "Required module '$Name' is not available. Install/enable IIS Management Scripts and Tools."
+    return $false
+  }
+  return $true
+}
+
+function Get-FriendlyCertInfo {
+  param(
+    [string]$Thumbprint,
+    [string]$StoreName = "My",
+    [string]$StoreLocation = "LocalMachine"
+  )
+  $result = [ordered]@{
+    Thumbprint      = $null
+    Subject         = $null
+    Issuer          = $null
+    NotBefore       = $null
+    NotAfter        = $null
+    DaysToExpire    = $null
+    HasPrivateKey   = $false
+    Status          = "NotFound"
+    FriendlyName    = $null
+    DnsNames        = @()
+  }
+
+  if ([string]::IsNullOrWhiteSpace($Thumbprint)) { return $result }
+
+  try {
+    $thumb = ($Thumbprint -replace '\s','').ToUpper()
+    $storePath = "Cert:\$StoreLocation\$StoreName"
+    $cert = Get-ChildItem -Path $storePath | Where-Object { $_.Thumbprint -replace '\s','' -eq $thumb }
+    if ($cert) {
+      $days = [int]([datetime]::UtcNow - $cert.NotAfter.ToUniversalTime()).TotalDays
+      $result.Thumbprint    = $cert.Thumbprint
+      $result.Subject       = $cert.Subject
+      $result.Issuer        = $cert.Issuer
+      $result.NotBefore     = $cert.NotBefore
+      $result.NotAfter      = $cert.NotAfter
+      $result.DaysToExpire  = [int]([TimeSpan]::FromTicks($cert.NotAfter.Ticks - (Get-Date).Ticks).TotalDays)
+      $result.HasPrivateKey = $cert.HasPrivateKey
+      $result.FriendlyName  = $cert.FriendlyName
+      try {
+        $dns = @()
+        if ($cert.Extensions) {
+          foreach ($ext in $cert.Extensions) {
+            if ($ext.Oid.FriendlyName -eq "Subject Alternative Name") {
+              # Parse SAN DNS names
+              $data = $ext.Format($true)
+              $dns += ($data -split '\s*,\s*') -replace 'DNS Name=\s*',''
+            }
+          }
+        }
+        $result.DnsNames = $dns | Where-Object { $_ }
+      } catch { }
+
+      if ($result.DaysToExpire -lt 0) {
+        $result.Status = "Expired"
+      } elseif ($result.DaysToExpire -le 30) {
+        $result.Status = "ExpiringSoon"
+      } else {
+        $result.Status = "Valid"
+      }
+    }
+  } catch {
+    $result.Status = "Error: $($_.Exception.Message)"
+  }
+  return $result
+}
+
+function Test-LogonAsService {
+  param(
+    [string]$Account
+  )
+  # Best-effort check: query local policy assignment and membership of IIS_IUSRS/Administrators.
+  # Full domain policy evaluation requires AD/GPO context and is outside read-only local scope.
+  $hasRight = $null
+  try {
+    # Modern Windows: use secedit export and parse (read-only)
+    $temp = Join-Path $env:TEMP ("secpol_{0}.inf" -f ([guid]::NewGuid()))
+    secedit /export /cfg $temp *>$null
+    $content = Get-Content -Path $temp -ErrorAction SilentlyContinue
+    Remove-Item $temp -Force -ErrorAction SilentlyContinue
+    $line = $content | Where-Object { $_ -match '^SeServiceLogonRight\s*=' }
+    if ($line) {
+      $principals = ($line -split '=')[1].Trim() -split ','
+      $norm = $Account.Trim()
+      $hasRight = ($principals -match $norm).Count -gt 0
+    }
+  } catch {
+    $hasRight = $null
+  }
+  return $hasRight
+}
+
+function Get-IISAuthSettings {
+  param([string]$SiteName, [string]$AppPath = "/")
+  # Returns Windows/Anonymous auth status where available.
+  $auth = [ordered]@{
+    AnonymousAuthentication = $null
+    WindowsAuthentication   = $null
+    Providers               = @()
+  }
+  try {
+    $base = "IIS:\Sites\$SiteName$AppPath"
+    $anon = Get-WebConfigurationProperty -PSPath 'IIS:\' -Location $SiteName -Filter "system.webServer/security/authentication/anonymousAuthentication" -Name enabled -ErrorAction SilentlyContinue
+    $win  = Get-WebConfigurationProperty -PSPath 'IIS:\' -Location $SiteName -Filter "system.webServer/security/authentication/windowsAuthentication" -Name enabled -ErrorAction SilentlyContinue
+    if ($anon) { $auth.AnonymousAuthentication = [bool]$anon.Value }
+    if ($win)  { 
+      $auth.WindowsAuthentication = [bool]$win.Value
+      if ($auth.WindowsAuthentication) {
+        $prov = Get-WebConfigurationProperty -PSPath 'IIS:\' -Location $SiteName -Filter "system.webServer/security/authentication/windowsAuthentication/providers" -Name "." -ErrorAction SilentlyContinue
+        if ($prov) {
+          $auth.Providers = @($prov.Collection | ForEach-Object { $_.Attributes["value"].Value })
+        }
+      }
+    }
+  } catch { }
+  return $auth
+}
+
+function Find-OldDomainReferencesInFiles {
+  param([string]$RootPath, [string]$OldDomain)
+  $hits = @()
+  if (-not (Test-Path $RootPath)) { return $hits }
+  $patterns = @('web.config','*.config','appsettings*.json','*.json')
+  try {
+    $files = Get-ChildItem -Path $RootPath -Recurse -File -ErrorAction SilentlyContinue |
+      Where-Object { $patterns | ForEach-Object { $_ } | ForEach-Object { $_ } | ForEach-Object { $true } }  # we’ll filter in Where-Object
+    $files = Get-ChildItem -Path $RootPath -Recurse -File -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -like 'web.config' -or $_.Name -like '*.config' -or $_.Name -like 'appsettings*.json' -or $_.Name -like '*.json' }
+
+    foreach ($f in $files) {
+      try {
+        $lines = Select-String -Path $f.FullName -Pattern $OldDomain -SimpleMatch -CaseSensitive:$false -ErrorAction SilentlyContinue
+        if ($lines) {
+          $hits += $lines | ForEach-Object {
+            [pscustomobject]@{
+              File      = $f.FullName
+              Line      = $_.Line
+              LineNumber= $_.LineNumber
+            }
+          }
+        }
+      } catch { }
+    }
+  } catch { }
+  return $hits
+}
+
+# --- MAIN ---
+if (-not (Test-Module -Name WebAdministration)) { Import-Module WebAdministration -ErrorAction SilentlyContinue | Out-Null }
+if (-not (Get-Module -Name WebAdministration)) {
+  Write-Error "WebAdministration module is required. Aborting."
+  return
+}
+
+$report = [ordered]@{
+  Hostname            = $env:COMPUTERNAME
+  Timestamp           = (Get-Date)
+  OldDomain           = $OldDomain
+  NewDomain           = $NewDomain
+  AppPools            = @()
+  Sites               = @()
+  Summary             = [ordered]@{
+    AppPoolsUsingOldDomainAccounts   = 0
+    SitesWithHttps                   = 0
+    BindingsWithMissingOrExpiredCert = 0
+    BindingsWithNoPrivateKey         = 0
+    VirtualDirsWithUNC               = 0
+    ConfigHitsForOldDomain           = 0
+  }
+  Warnings            = @()
+}
+
+# App Pools
+$appPools = Get-Item IIS:\AppPools\* -ErrorAction SilentlyContinue
+foreach ($ap in $appPools) {
+  $identityType = $ap.processModel.identityType
+  $userName     = $ap.processModel.userName
+  $usesCustom   = ($identityType -eq 3 -or $identityType -eq "SpecificUser" -or $identityType -eq "CustomAccount")
+  $oldDomainHit = $false
+  if ($usesCustom -and $userName) {
+    $oldDomainHit = ($userName -match [regex]::Escape($OldDomain))
+  }
+  if ($oldDomainHit) { $report.Summary.AppPoolsUsingOldDomainAccounts++ }
+
+  $logonRight = $null
+  if ($usesCustom -and $userName) {
+    $logonRight = Test-LogonAsService -Account $userName
+  }
+
+  $report.AppPools += [pscustomobject]@{
+    Name            = $ap.Name
+    State           = $ap.State
+    IdentityType    = $identityType
+    IdentityUser    = $userName
+    UsesOldDomain   = $oldDomainHit
+    LogonAsService  = $logonRight
+    QueueLength     = $ap.queueLength
+    ManagedPipeline = $ap.managedPipelineMode
+    RuntimeVersion  = $ap.managedRuntimeVersion
+  }
+}
+
+# Sites & Bindings
+$sites = Get-Item IIS:\Sites\* -ErrorAction SilentlyContinue
+foreach ($site in $sites) {
+  $siteObj = [ordered]@{
+    Name        = $site.Name
+    State       = $site.State
+    PhysicalPath= (Get-ItemProperty "IIS:\Sites\$($site.Name)").physicalPath
+    Auth        = Get-IISAuthSettings -SiteName $site.Name
+    Bindings    = @()
+    VirtualDirs = @()
+    ConfigHits  = @()
+  }
+
+  # Bindings
+  foreach ($b in $site.Bindings.Collection) {
+    $bindingInfo = $b.bindingInformation
+    $protocol    = $b.protocol
+    $hostname    = $b.hostname
+    $ip, $port, $unused = $bindingInfo -split ':'
+    $thumb = $null
+    $sni   = $false
+
+    if ($protocol -eq "https") {
+      $report.Summary.SitesWithHttps++
+      try {
+        # Read SSL flags and cert hash via WebAdministration
+        $path = "IIS:\SslBindings\!$ip!$port!$hostname"
+        # Fallback: enumerate ssl bindings and match
+        $sslBindings = Get-ChildItem IIS:\SslBindings -ErrorAction SilentlyContinue
+        $match = $sslBindings | Where-Object {
+          $_.Port -eq [int]$port -and
+          ( ($_.IPAddress -eq $ip) -or ([string]::IsNullOrWhiteSpace($ip) -and $_.IPAddress -eq "0.0.0.0") ) -and
+          ( [string]::IsNullOrWhiteSpace($hostname) -or $_.Host -eq $hostname )
+        }
+        if ($match) {
+          $thumb = $match.Thumbprint
+          $sni   = [bool]$match.SNI
+        }
+      } catch { }
+
+      $certInfo = Get-FriendlyCertInfo -Thumbprint $thumb
+      $needsCert = ($certInfo.Status -in @("NotFound","Expired","ExpiringSoon")) -or (-not $certInfo.HasPrivateKey)
+      if ($needsCert) { 
+        $report.Summary.BindingsWithMissingOrExpiredCert++
+        if (-not $certInfo.HasPrivateKey) { $report.Summary.BindingsWithNoPrivateKey++ }
+      }
+
+      $siteObj.Bindings += [pscustomobject]@{
+        Protocol      = $protocol
+        IP            = $ip
+        Port          = [int]$port
+        Hostname      = $hostname
+        SNI           = $sni
+        CertThumbprint= $thumb
+        CertSubject   = $certInfo.Subject
+        CertIssuer    = $certInfo.Issuer
+        CertNotAfter  = $certInfo.NotAfter
+        DaysToExpire  = $certInfo.DaysToExpire
+        CertStatus    = $certInfo.Status
+        HasPrivateKey = $certInfo.HasPrivateKey
+        SANs          = ($certInfo.DnsNames -join ', ')
+      }
+    }
+    else {
+      $siteObj.Bindings += [pscustomobject]@{
+        Protocol      = $protocol
+        IP            = $ip
+        Port          = [int]$port
+        Hostname      = $hostname
+        SNI           = $null
+        CertThumbprint= $null
+        CertSubject   = $null
+        CertIssuer    = $null
+        CertNotAfter  = $null
+        DaysToExpire  = $null
+        CertStatus    = $null
+        HasPrivateKey = $null
+        SANs          = $null
+      }
+    }
+  }
+
